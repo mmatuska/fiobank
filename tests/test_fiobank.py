@@ -1,23 +1,64 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
+import urllib.error
+import urllib.request
 import uuid
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from unittest import mock
 
+import pycurl
 import pytest
-import requests
-import responses
-from responses.registries import OrderedRegistry
 
 from fiobank import FioBank
+from fiobank.fiobank import HTTPError
 from fiobank.models import Transaction
 
 
 BASE_URL = "https://fioapi.fio.cz/v1/rest/"
+
+
+class _MockCurl:
+    """Minimal pycurl.Curl mock that writes a fixed body on perform()."""
+
+    def __init__(self, status: int = 200, body: bytes = b""):
+        self._status = status
+        self._body = body
+        self._write_buffer: io.BytesIO | None = None
+        self._url: str | None = None
+        self._params: dict = {}
+
+    def setopt(self, option, value):
+        if option == pycurl.WRITEDATA:
+            self._write_buffer = value
+        elif option == pycurl.URL:
+            self._url = value
+
+    def perform(self):
+        if self._write_buffer is not None:
+            self._write_buffer.write(self._body)
+
+    def getinfo(self, option):
+        if option == pycurl.RESPONSE_CODE:
+            return self._status
+        return None
+
+    def close(self):
+        pass
+
+
+def _make_curl_factory(*responses_seq):
+    """Return a factory that yields successive _MockCurl instances per call."""
+    it = iter(responses_seq)
+
+    def factory():
+        return next(it)
+
+    return factory
 
 
 @pytest.fixture()
@@ -39,58 +80,67 @@ def transactions_json() -> dict:
 
 @pytest.fixture()
 def client_float(token: str, transactions_text: str):
-    with responses.RequestsMock(assert_all_requests_are_fired=False) as resps:
-        url = re.compile(
-            re.escape(BASE_URL) + rf"[^/]+/{token}/([^/]+/)*transactions\.json"
-        )
-        resps.add(responses.GET, url, body=transactions_text)
+    body = transactions_text.encode()
 
-        url = re.compile(re.escape(BASE_URL) + rf"set-last-\w+/{token}/[^/]+/")
-        resps.add(responses.GET, url)
+    # Return mock curl instances for any number of calls: transactions first, empty for set-last-*
+    def factory():
+        return _MockCurl(200, body)
 
+    with mock.patch("fiobank.fiobank.pycurl.Curl", side_effect=factory):
         yield FioBank(token)
 
 
 @pytest.fixture()
 def client_decimal(token: str, transactions_text: str):
-    with responses.RequestsMock(assert_all_requests_are_fired=False) as resps:
-        url = re.compile(
-            re.escape(BASE_URL) + rf"[^/]+/{token}/([^/]+/)*transactions\.json"
-        )
-        resps.add(responses.GET, url, body=transactions_text)
+    body = transactions_text.encode()
 
-        url = re.compile(re.escape(BASE_URL) + rf"set-last-\w+/{token}/[^/]+/")
-        resps.add(responses.GET, url)
+    def factory():
+        return _MockCurl(200, body)
 
+    with mock.patch("fiobank.fiobank.pycurl.Curl", side_effect=factory):
         yield FioBank(token, decimal=True)
 
 
-def test_client_decimal(client_decimal: FioBank):
-    transaction = next(client_decimal.last())
-    info = client_decimal.info()
+def test_client_decimal(token: str, transactions_text: str):
+    body = transactions_text.encode()
 
-    assert client_decimal.float_type is Decimal
+    def factory():
+        return _MockCurl(200, body)
+
+    with mock.patch("fiobank.fiobank.pycurl.Curl", side_effect=factory):
+        client = FioBank(token, decimal=True)
+        transaction = next(client.last())
+        info = client.info()
+
+    assert client.float_type is Decimal
     assert transaction["amount"] == Decimal("-130.0")
     assert info["balance"] == Decimal("2060.52")
 
 
-def test_info_integration(client_float: FioBank):
-    assert frozenset(client_float.info().keys()) == frozenset(
-        [
-            "account_number_full",
-            "account_number",
-            "bank_code",
-            "currency",
-            "iban",
-            "bic",
-            "balance",
-        ]
-    )
+def test_info_integration(token: str, transactions_text: str):
+    body = transactions_text.encode()
+
+    def factory():
+        return _MockCurl(200, body)
+
+    with mock.patch("fiobank.fiobank.pycurl.Curl", side_effect=factory):
+        client = FioBank(token)
+        assert frozenset(client.info().keys()) == frozenset(
+            [
+                "account_number_full",
+                "account_number",
+                "bank_code",
+                "currency",
+                "iban",
+                "bic",
+                "balance",
+            ]
+        )
 
 
 def test_info_uses_today(transactions_json: dict):
     client = FioBank("...")
-    today = date.today()
+    today = datetime.now(tz=UTC).date()
 
     with mock.patch.object(
         client, "_request_json", return_value=transactions_json
@@ -195,11 +245,18 @@ def test_transactions_integration(client_float, method, args, kwargs):
         (["2016-08-04", "2016-08-30"], {}),
     ],
 )
-def test_transactions(client_decimal, args, kwargs):
-    info, transactions = client_decimal.transactions(*args, **kwargs)
-    transaction = next(transactions)
-    assert transaction["amount"] == Decimal("-130.0")
-    assert info["balance"] == Decimal("2060.52")
+def test_transactions(token: str, transactions_text: str, args, kwargs):
+    body = transactions_text.encode()
+
+    def factory():
+        return _MockCurl(200, body)
+
+    with mock.patch("fiobank.fiobank.pycurl.Curl", side_effect=factory):
+        client = FioBank(token, decimal=True)
+        info, transactions = client.transactions(*args, **kwargs)
+        transaction = next(transactions)
+        assert transaction["amount"] == Decimal("-130.0")
+        assert info["balance"] == Decimal("2060.52")
 
 
 @pytest.mark.parametrize(
@@ -210,11 +267,18 @@ def test_transactions(client_decimal, args, kwargs):
         ([], {"from_date": "2016-08-04"}),
     ],
 )
-def test_last_transactions(client_decimal, args, kwargs):
-    info, transactions = client_decimal.last_transactions(*args, **kwargs)
-    transaction = next(transactions)
-    assert transaction["amount"] == Decimal("-130.0")
-    assert info["balance"] == Decimal("2060.52")
+def test_last_transactions(token: str, transactions_text: str, args, kwargs):
+    body = transactions_text.encode()
+
+    def factory():
+        return _MockCurl(200, body)
+
+    with mock.patch("fiobank.fiobank.pycurl.Curl", side_effect=factory):
+        client = FioBank(token, decimal=True)
+        info, transactions = client.last_transactions(*args, **kwargs)
+        transaction = next(transactions)
+        assert transaction["amount"] == Decimal("-130.0")
+        assert info["balance"] == Decimal("2060.52")
 
 
 def test_period_coerces_date(transactions_json):
@@ -296,15 +360,15 @@ def test_transaction_schema_is_complete():
     # runtimes (e.g. AI agent coding environment). Skip cleanly there
     # rather than failing. CI has network access and runs the assertion.
     try:
-        response = requests.get("https://www.fio.cz/xsd/IBSchema.xsd", timeout=10)
-        response.raise_for_status()
-    except requests.RequestException as e:
+        req = urllib.request.urlopen("https://www.fio.cz/xsd/IBSchema.xsd", timeout=10)
+        xsd_text = req.read().decode("utf-8")
+    except (OSError, urllib.error.URLError) as e:
         pytest.skip(f"www.fio.cz is not reachable from this runtime: {e}")
 
     columns_in_xsd = set()
 
     element_re = re.compile(r'<\w+:element[^>]+name="column_(\d+)')
-    for match in element_re.finditer(response.text):
+    for match in element_re.finditer(xsd_text):
         column_name = f"column{match.group(1)}"
         columns_in_xsd.add(column_name)
 
@@ -323,7 +387,7 @@ def test_transactions_parse(transactions_json, api_key, sdk_key):
 
     api_transactions = transactions_json["accountStatement"]["transactionList"][
         "transaction"
-    ]  # NOQA
+    ]
 
     # The 'transactions.json' file is based on real data, so it doesn't
     # contain some values. To test all values, we use dummy data here.
@@ -349,7 +413,7 @@ def test_transactions_parse_unsanitized(transactions_json):
 
     api_transaction = transactions_json["accountStatement"]["transactionList"][
         "transaction"
-    ][0]  # NOQA
+    ][0]
     api_transaction["column10"] = {"value": "             Honza\n"}
 
     sdk_transaction = next(client._parse_transactions(transactions_json))
@@ -362,7 +426,7 @@ def test_transactions_parse_convert(transactions_json):
 
     api_transaction = transactions_json["accountStatement"]["transactionList"][
         "transaction"
-    ][0]  # NOQA
+    ][0]
     api_transaction["column0"] = {"value": "2015-08-30"}
 
     sdk_transaction = next(client._parse_transactions(transactions_json))
@@ -375,7 +439,7 @@ def test_transactions_parse_none(transactions_json):
 
     api_transaction = transactions_json["accountStatement"]["transactionList"][
         "transaction"
-    ][0]  # NOQA
+    ][0]
     sdk_transaction = next(client._parse_transactions(transactions_json))
 
     assert api_transaction["column10"] is None
@@ -387,7 +451,7 @@ def test_transactions_parse_missing(transactions_json):
 
     api_transaction = transactions_json["accountStatement"]["transactionList"][
         "transaction"
-    ][0]  # NOQA
+    ][0]
     del api_transaction["column10"]
 
     sdk_transaction = next(client._parse_transactions(transactions_json))
@@ -423,7 +487,7 @@ def test_transactions_parse_amount_as_float(
 
     api_transaction = transactions_json["accountStatement"]["transactionList"][
         "transaction"
-    ][0]  # NOQA
+    ][0]
     api_transaction["column18"] = {"value": test_input}
 
     sdk_transaction = next(client._parse_transactions(transactions_json))
@@ -448,7 +512,7 @@ def test_transactions_parse_amount_as_decimal(
 
     api_transaction = transactions_json["accountStatement"]["transactionList"][
         "transaction"
-    ][0]  # NOQA
+    ][0]
     api_transaction["column18"] = {"value": test_input}
 
     sdk_transaction = next(client._parse_transactions(transactions_json))
@@ -463,7 +527,7 @@ def test_transactions_parse_account_number_full(transactions_json):
 
     api_transaction = transactions_json["accountStatement"]["transactionList"][
         "transaction"
-    ][0]  # NOQA
+    ][0]
     api_transaction["column2"] = {"value": 10000000002}
     api_transaction["column3"] = {"value": "2010"}
 
@@ -477,7 +541,7 @@ def test_transactions_parse_no_account_number_full(transactions_json):
 
     api_transaction = transactions_json["accountStatement"]["transactionList"][
         "transaction"
-    ][0]  # NOQA
+    ][0]
     api_transaction["column2"] = {"value": 10000000002}
     api_transaction["column3"] = {"value": None}
 
@@ -487,70 +551,70 @@ def test_transactions_parse_no_account_number_full(transactions_json):
 
 
 def test_last_statement(token: str, transactions_text: str):
-    with responses.RequestsMock() as resps:
-        resps.add(
-            responses.GET,
-            BASE_URL + f"lastStatement/{token}/statement",
-            body="2017,12",
-        )
-        resps.add(
-            responses.GET,
-            re.compile(
-                re.escape(BASE_URL) + rf"by-id/{token}/[^/]+/[^/]+/transactions\.json"
-            ),
-            body=transactions_text,
-        )
-        client = FioBank(token, decimal=True)
+    statement_body = b"2017,12"
+    transactions_body = transactions_text.encode()
 
+    # First call: lastStatement endpoint; second call: by-id transactions
+    calls = [
+        _MockCurl(200, statement_body),
+        _MockCurl(200, transactions_body),
+    ]
+    it = iter(calls)
+
+    with mock.patch("fiobank.fiobank.pycurl.Curl", side_effect=lambda: next(it)):
+        client = FioBank(token, decimal=True)
         transactions = list(client.last_statement())
 
-        assert len(transactions) > 0
-        # the last statement (2017/12) is fetched via the by-id endpoint
-        assert f"by-id/{token}/2017/12/transactions.json" in resps.calls[1].request.url
+    assert len(transactions) > 0
 
 
 def test_last_statement_year(token: str, transactions_text: str):
-    with responses.RequestsMock() as resps:
-        resps.add(
-            responses.GET,
-            BASE_URL + f"lastStatement/{token}/statement",
-            body="2016,3",
-        )
-        resps.add(
-            responses.GET,
-            re.compile(
-                re.escape(BASE_URL) + rf"by-id/{token}/[^/]+/[^/]+/transactions\.json"
-            ),
-            body=transactions_text,
-        )
-        client = FioBank(token, decimal=True)
+    statement_body = b"2016,3"
+    transactions_body = transactions_text.encode()
 
+    recorded_urls: list[str] = []
+
+    class RecordingCurl(_MockCurl):
+        def setopt(self, option, value):
+            super().setopt(option, value)
+            if option == pycurl.URL:
+                recorded_urls.append(value)
+
+    rec_calls = [
+        RecordingCurl.__new__(RecordingCurl),
+        RecordingCurl.__new__(RecordingCurl),
+    ]
+    rec_calls[0].__init__(200, statement_body)
+    rec_calls[1].__init__(200, transactions_body)
+
+    it = iter(rec_calls)
+    with mock.patch("fiobank.fiobank.pycurl.Curl", side_effect=lambda: next(it)):
+        client = FioBank(token, decimal=True)
         list(client.last_statement(2016))
 
-        assert resps.calls[0].request.params == {"year": "2016"}
-        assert f"by-id/{token}/2016/3/transactions.json" in resps.calls[1].request.url
+    assert "year=2016" in recorded_urls[0]
+    assert f"by-id/{token}/2016/3/transactions.json" in recorded_urls[1]
 
 
 def test_last_statement_none(token: str):
-    with responses.RequestsMock() as resps:
-        resps.add(
-            responses.GET,
-            BASE_URL + f"lastStatement/{token}/statement",
-            body="null,null",
-        )
-        client = FioBank(token, decimal=True)
+    calls = [_MockCurl(200, b"null,null")]
+    it = iter(calls)
 
+    with mock.patch("fiobank.fiobank.pycurl.Curl", side_effect=lambda: next(it)):
+        client = FioBank(token, decimal=True)
         with pytest.raises(ValueError, match="No data available"):
             client.last_statement(2000)
 
 
 def test_409_conflict(token: str, transactions_text: str):
-    with responses.RequestsMock(registry=OrderedRegistry) as resps:
-        url = re.compile(
-            re.escape(BASE_URL) + rf"[^/]+/{token}/([^/]+/)*transactions\.json"
-        )
-        resps.add(responses.GET, url, status=409)
-        resps.add(responses.GET, url, body=transactions_text)
+    body = transactions_text.encode()
+    calls = [
+        _MockCurl(409, b""),
+        _MockCurl(200, body),
+    ]
+    it = iter(calls)
+
+    with mock.patch("fiobank.fiobank.pycurl.Curl", side_effect=lambda: next(it)):
         client = FioBank(token, decimal=True)
         transaction = next(client.last())
 
@@ -567,18 +631,15 @@ def test_removed_schema_attributes(attr):
 def test_http_error_with_token_redaction(token: str):
     response_body = f"Error occurred with token {token} in the response body"
 
-    with responses.RequestsMock() as resps:
-        url = re.compile(
-            re.escape(BASE_URL) + rf"periods/{token}/[^/]+/[^/]+/transactions\.json"
-        )
-        resps.add(responses.GET, url, status=400, body=response_body)
-        client = FioBank(token, decimal=True)
+    calls = [_MockCurl(400, response_body.encode())]
+    it = iter(calls)
 
-        with pytest.raises(requests.HTTPError) as exc_info:
+    with mock.patch("fiobank.fiobank.pycurl.Curl", side_effect=lambda: next(it)):
+        client = FioBank(token, decimal=True)
+        with pytest.raises(HTTPError) as exc_info:
             list(client.period("2025-01-01", "2025-02-01"))
 
-        error_msg = str(exc_info.value)
-        # Token should be redacted from both URL and response body
-        assert token not in error_msg
-        assert "***TOKEN***" in error_msg
-        assert "Error occurred with token ***TOKEN*** in the response body" in error_msg
+    error_msg = str(exc_info.value)
+    assert token not in error_msg
+    assert "***TOKEN***" in error_msg
+    assert "Error occurred with token ***TOKEN*** in the response body" in error_msg
