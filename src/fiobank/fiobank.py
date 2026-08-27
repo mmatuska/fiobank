@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import re
 import urllib.parse
 import warnings
@@ -96,7 +97,15 @@ class FioBank:
             curl.setopt(pycurl.URL, url)
             curl.setopt(pycurl.WRITEDATA, body_buffer)
             curl.setopt(pycurl.HEADERFUNCTION, header_buffer.write)
-            curl.setopt(pycurl.TIMEOUT_MS, int(self.request_timeout * 1000))
+            # Use a connect timeout plus a low-speed (read-idle) timeout to
+            # replicate the prior requests behavior where timeout= applied to
+            # connect and to read inactivity separately, rather than the whole
+            # transfer duration.
+            connect_timeout_ms = max(1, math.ceil(self.request_timeout * 1000))
+            curl.setopt(pycurl.CONNECTTIMEOUT_MS, connect_timeout_ms)
+            # Abort if fewer than 1 byte/s arrives for request_timeout seconds.
+            curl.setopt(pycurl.LOW_SPEED_LIMIT, 1)
+            curl.setopt(pycurl.LOW_SPEED_TIME, max(1, math.ceil(self.request_timeout)))
             curl.setopt(pycurl.FOLLOWLOCATION, True)
             curl.perform()
             status_code = curl.getinfo(pycurl.RESPONSE_CODE)
