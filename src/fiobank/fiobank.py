@@ -17,17 +17,9 @@ from tenacity import (
     wait_random_exponential,
 )
 
-from .exceptions import ThrottlingError
+from .exceptions import HTTPError, ThrottlingError
 from .models import Info, Transaction
 from .utils import coerce_date
-
-
-class HTTPError(IOError):
-    """Raised when an HTTP request returns a non-2xx status code."""
-
-    def __init__(self, message: str, *, status_code: int) -> None:
-        self.status_code = status_code
-        super().__init__(message)
 
 
 class FioBank:
@@ -119,7 +111,7 @@ class FioBank:
         if status_code < 200 or status_code >= 300:
             sanitized_url = url.replace(self.token, "***TOKEN***")
             sanitized_body = body.replace(self.token, "***TOKEN***")
-            msg = f"{status_code} Client Error for url: {sanitized_url}"
+            msg = f"{status_code} HTTP Error for url: {sanitized_url}"
             if sanitized_body:
                 msg = f"{msg}. Response body: {sanitized_body}"
             raise HTTPError(msg, status_code=status_code)

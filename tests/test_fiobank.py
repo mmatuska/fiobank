@@ -7,15 +7,14 @@ import re
 import urllib.error
 import urllib.request
 import uuid
-from datetime import UTC, date, datetime
+from datetime import date
 from decimal import Decimal
 from unittest import mock
 
 import pycurl
 import pytest
 
-from fiobank import FioBank
-from fiobank.fiobank import HTTPError
+from fiobank import FioBank, HTTPError
 from fiobank.models import Transaction
 
 
@@ -24,6 +23,16 @@ BASE_URL = "https://fioapi.fio.cz/v1/rest/"
 
 class _MockCurl:
     """Minimal pycurl.Curl mock that writes a fixed body on perform()."""
+
+    _url_pattern = re.compile(
+        r"^https://fioapi\.fio\.cz/v1/rest/"
+        r"(periods/[^/]+/\d{4}-\d{2}-\d{2}/\d{4}-\d{2}-\d{2}/transactions\.json"
+        r"|by-id/[^/]+/\d{4}/\d+/transactions\.json"
+        r"|last/[^/]+/transactions\.json"
+        r"|set-last-id/[^/]+/\d+/"
+        r"|set-last-date/[^/]+/\d{4}-\d{2}-\d{2}/"
+        r"|lastStatement/[^/]+/statement(\?year=\d{4})?)$"
+    )
 
     def __init__(self, status: int = 200, body: bytes = b""):
         self._status = status
@@ -39,6 +48,8 @@ class _MockCurl:
             self._url = value
 
     def perform(self):
+        if self._url is None or not self._url_pattern.match(self._url):
+            raise AssertionError(f"Unexpected request URL: {self._url!r}")
         if self._write_buffer is not None:
             self._write_buffer.write(self._body)
 
@@ -140,7 +151,7 @@ def test_info_integration(token: str, transactions_text: str):
 
 def test_info_uses_today(transactions_json: dict):
     client = FioBank("...")
-    today = datetime.now(tz=UTC).date()
+    today = date.today()
 
     with mock.patch.object(
         client, "_request_json", return_value=transactions_json
