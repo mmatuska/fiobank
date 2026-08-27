@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import io
+import json
+import math
 import re
+import urllib.parse
 import warnings
 from collections.abc import Generator
 from datetime import date, datetime
 from decimal import Decimal
 
-import requests
+import pycurl
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -14,7 +18,7 @@ from tenacity import (
     wait_random_exponential,
 )
 
-from .exceptions import ThrottlingError
+from .exceptions import HTTPError, ThrottlingError
 from .models import Info, Transaction
 from .utils import coerce_date
 
@@ -81,40 +85,55 @@ class FioBank:
         stop=stop_after_attempt(3),
         wait=wait_random_exponential(max=2 * 60),
     )
-    def _request(self, url: str, params: dict | None = None) -> requests.Response:
-        response = requests.get(url, params=params, timeout=self.request_timeout)
-        if response.status_code == requests.codes["conflict"]:
+    def _request(self, url: str, params: dict | None = None) -> tuple[int, str]:
+        if params:
+            url = url + "?" + urllib.parse.urlencode(params)
+
+        body_buffer = io.BytesIO()
+        header_buffer = io.BytesIO()
+
+        curl = pycurl.Curl()
+        try:
+            curl.setopt(pycurl.URL, url)
+            curl.setopt(pycurl.WRITEDATA, body_buffer)
+            curl.setopt(pycurl.HEADERFUNCTION, header_buffer.write)
+            # Use a connect timeout plus a low-speed (read-idle) timeout to
+            # replicate the prior requests behavior where timeout= applied to
+            # connect and to read inactivity separately, rather than the whole
+            # transfer duration.
+            connect_timeout_ms = max(1, math.ceil(self.request_timeout * 1000))
+            curl.setopt(pycurl.CONNECTTIMEOUT_MS, connect_timeout_ms)
+            # Abort if fewer than 1 byte/s arrives for request_timeout seconds.
+            curl.setopt(pycurl.LOW_SPEED_LIMIT, 1)
+            curl.setopt(pycurl.LOW_SPEED_TIME, max(1, math.ceil(self.request_timeout)))
+            curl.setopt(pycurl.FOLLOWLOCATION, True)
+            curl.perform()
+            status_code = curl.getinfo(pycurl.RESPONSE_CODE)
+        finally:
+            curl.close()
+
+        body = body_buffer.getvalue().decode("utf-8", errors="replace")
+
+        if status_code == 409:
             raise ThrottlingError()
 
-        # Handle all other HTTP errors with token sanitization and response body
-        try:
-            response.raise_for_status()
-        except requests.HTTPError as e:
-            # Get the original error message and sanitize token
-            sanitized_msg = str(e).replace(self.token, "***TOKEN***")
+        if status_code < 200 or status_code >= 300:
+            sanitized_url = url.replace(self.token, "***TOKEN***")
+            sanitized_body = body.replace(self.token, "***TOKEN***")
+            msg = f"{status_code} HTTP Error for url: {sanitized_url}"
+            if sanitized_body:
+                msg = f"{msg}. Response body: {sanitized_body}"
+            raise HTTPError(msg, status_code=status_code)
 
-            # Try to get response body and sanitize it too
-            try:
-                response_body = response.text
-                if response_body:
-                    # Sanitize token from response body as well
-                    sanitized_body = response_body.replace(self.token, "***TOKEN***")
-                    # Append response body to the error message
-                    sanitized_msg = f"{sanitized_msg}. Response body: {sanitized_body}"
-            except Exception:
-                pass  # If we can't get response body, just use the original error
-
-            raise requests.HTTPError(sanitized_msg, response=response)
-
-        return response
+        return status_code, body
 
     def _request_json(self, action: str, **params) -> dict | None:
         url_template = self.base_url + self._actions[action]
         url = url_template.format(token=self.token, **params)
 
-        response = self._request(url)
-        if response.content:
-            return response.json(parse_float=self.float_type)
+        _status, body = self._request(url)
+        if body:
+            return json.loads(body, parse_float=self.float_type)
         return None
 
     def _parse_info(self, data: dict) -> dict:
@@ -226,8 +245,8 @@ class FioBank:
         url = self.base_url + self._actions["last-statement"].format(token=self.token)
         params = {"year": year} if year is not None else None
 
-        response = self._request(url, params=params)
-        year_value, _, number_value = response.text.strip().partition(",")
+        _status, text = self._request(url, params=params)
+        year_value, _, number_value = text.strip().partition(",")
         if year_value == "null" or not number_value:
             return None
         return (int(year_value), int(number_value))
